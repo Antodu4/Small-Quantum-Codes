@@ -230,7 +230,7 @@ def main():
     sep  = "=" * 70
     print()
     print(sep)
-    print("QP2 qp_edit RST BLOCK  (paste into the Determinants section)")
+    print("QP2 qp_edit RST BLOCK ")
     print(sep)
     print()
 
@@ -277,10 +277,6 @@ def main():
         print(f"  {b_str}")
 
     print()
-    print(sep)
-    print(f"Copy the block above (from 'Force...' to the last beta string).")
-    print(f"Then run:  qp_edit <new_ezfio>  and replace the Determinants")
-    print(f"section with it. Set read_wf = true before running the FCI.")
     print(sep)
 
 
