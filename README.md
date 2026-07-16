@@ -49,26 +49,27 @@
   | `--ezfio-path PATH` | Override auto-detection of the `ezfio.py` module |
 
 
-  ### `extract_state.py` — Single-state extractor for QP2
+  ### `extract_states.py` — State extractor for QP2
 
-  Reduces a multi-state [EZFIO](https://github.com/TREX-CoE/ezfio) database to a single target state (`n_states` → 1), keeping the
-  full determinant space but only the CI coefficients of the chosen state (renormalised by default). The resulting EZFIO provides a
-  high-quality starting wavefunction for a state-targeted CIPSI calculation with `state_following`, avoiding the root-drifting that
-  occurs when starting from only a few dominant determinants.
+  Reduces a multi-state [EZFIO](https://github.com/TREX-CoE/ezfio) database to a chosen subset of states (`n_states` → K), keeping
+  the full determinant space but only the CI coefficients of the selected state(s) (renormalised by default). Works for a single
+  target state (`K` = 1) as well as a block of states (e.g. a resonance plus its neighbouring pseudo-continuum states), so a
+  (complex) Davidson run can follow the selected root(s) with `state_following` and avoid the root-drifting that occurs when
+  starting from only a few dominant determinants.
 
-  The EZFIO is modified **in place** — work on a copy. Also sets `state_average_weight` to `[1.0]` and `read_wf` to `True`;
+  The EZFIO is modified **in place** — work on a copy. Also sets `state_average_weight` to `[1/K] * K` and `read_wf` to `True`;
   `psi_det` and `n_det` are left untouched.
 
   cp -r multi_state.ezfio target.ezfio
-  python3 extract_state.py target.ezfio <state> [--no-normalize] [--dry-run]
+  python3 extract_states.py target.ezfio <states> [--no-normalize] [--dry-run]
 
   | Flag | Effect |
   |---|---|
   | `--no-normalize` | Keep the raw coefficients (no renormalisation) |
   | `--dry-run` | Print diagnostics (norm, dominant determinant) without writing |
 
-  The state index is 1-based, matching `Energy of state N` in QP output. Requires the QP environment to be sourced
-  (`quantum_package.rc`) so that the `ezfio` Python module is importable.
+  `<states>` is 1-based, matching `Energy of state N` in QP output, e.g. `30` for a single state or `42-50` / `42,47-49` for a
+  block. Requires the QP environment to be sourced (`quantum_package.rc`) so that the `ezfio` Python module is importable.
 
 ---------------------------------------------------------------------------------------------------------------------------------------  
 
@@ -76,9 +77,9 @@
 
   pip install requests numpy
 
-  The `extract_dominant_dets.py` and `extract_state.py` scripts also require the EZFIO Python module, which is bundled with QP2.
+  The `extract_dominant_dets.py` and `extract_states.py` scripts also require the EZFIO Python module, which is bundled with QP2.
   For `extract_dominant_dets.py` it is auto-detected from common install locations or via the `QP_ROOT` environment variable;
-  for `extract_state.py`, source `quantum_package.rc` before running.
+  for `extract_states.py`, source `quantum_package.rc` before running.
 
 ---------------------------------------------------------------------------------------------------------------------------------------
 

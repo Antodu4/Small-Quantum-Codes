@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-extract_states.py — Extrait un BLOC d'états d'un EZFIO multi-états et les
-                    sauve comme seuls états (n_states = K), pour un calcul
-                    CS multi-états avec state_following.
+extract_states.py — Extrait un ou plusieurs états d'un EZFIO multi-états et
+                    les sauve comme seuls états (n_states -> K), pour un
+                    calcul CIPSI/CS ciblé avec state_following.
 
-Généralisation de extract_state.py : au lieu d'un seul état, on garde une
-fenêtre d'états (ex. la résonance + les états de pseudo-continuum voisins),
-de sorte que le Davidson complexe suive un bloc de racines et que la
-trajectoire de la résonance reste identifiable quand le continuum tourne.
+Fonctionne aussi bien pour un état unique (ex. "30") que pour un bloc
+d'états (ex. "42-50", la résonance + les états de pseudo-continuum voisins),
+de sorte que le Davidson (complexe ou non) suive le(s) racine(s) souhaitée(s)
+et que leur trajectoire reste identifiable quand le continuum tourne.
 
 Usage
 -----
@@ -16,13 +16,16 @@ Usage
 Arguments
 ---------
     EZFIO       chemin du répertoire EZFIO à modifier (MODIFIÉ EN PLACE :
-                travaillez sur une copie, ex. `cp -r be.nat.14s11p be.blk.14s11p`)
-    STATES      états à garder, indexés à partir de 1, ex. "42-50" ou "42,47-49"
+                travaillez sur une copie, ex. `cp -r be.no.14s11p be.tgt.14s11p`)
+    STATES      état(s) à garder, indexé(s) à partir de 1, ex. "30" pour un
+                état unique, ou "42-50" / "42,47-49" pour un bloc d'états
                 (même numérotation que "Energy of state N" dans la sortie QP)
 
 Options
 -------
-    --no-normalize   ne pas renormaliser chaque vecteur extrait
+    --no-normalize   ne pas renormaliser le(s) vecteur(s) extrait(s) (par
+                     défaut, chacun est renormalisé à 1 dans l'espace des
+                     déterminants)
     --dry-run        affiche ce qui serait fait sans rien écrire
 
 Effets
@@ -39,8 +42,11 @@ Prérequis
     Environnement QP sourcé (module python `ezfio` dans le PYTHONPATH) :
         source ~/qp2_cs/quantum_package.rc
 
-Exemple
--------
+Exemples
+--------
+    cp -r be.no.14s11p be.tgt.14s11p
+    python3 extract_states.py be.tgt.14s11p 30
+
     cp -r be.nat.14s11p be.blk.42-50.14s11p
     python3 extract_states.py be.blk.42-50.14s11p 42-50
 """
@@ -64,15 +70,15 @@ def parse_states(spec):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extrait un bloc d'états d'un EZFIO multi-états (n_states -> K).",
+        description="Extrait un ou plusieurs états d'un EZFIO multi-états (n_states -> K).",
         epilog="L'EZFIO est modifié en place : travaillez sur une copie.",
     )
     parser.add_argument("ezfio_dir", metavar="EZFIO",
                         help="répertoire EZFIO (modifié en place)")
     parser.add_argument("states", metavar="STATES",
-                        help='états à garder, ex. "42-50" ou "42,47-49"')
+                        help='état(s) à garder, ex. "30" ou "42-50" ou "42,47-49"')
     parser.add_argument("--no-normalize", action="store_true",
-                        help="ne pas renormaliser les vecteurs extraits")
+                        help="ne pas renormaliser le(s) vecteur(s) extrait(s)")
     parser.add_argument("--dry-run", action="store_true",
                         help="n'écrit rien, affiche seulement le diagnostic")
     args = parser.parse_args()
@@ -87,9 +93,6 @@ def main():
         sys.exit(f"Erreur : répertoire EZFIO introuvable : {args.ezfio_dir}")
 
     keep = parse_states(args.states)
-    if len(keep) < 2:
-        sys.exit("Erreur : moins de 2 états demandés ; "
-                 "utilisez extract_state.py pour un état unique.")
 
     ezfio.set_file(args.ezfio_dir)
     n_det = ezfio.get_determinants_n_det()
@@ -103,6 +106,8 @@ def main():
     bad = [s for s in keep if not (1 <= s <= n_states)]
     if bad:
         sys.exit(f"Erreur : états hors de [1, {n_states}] : {bad}")
+    if n_states == 1 and len(keep) == 1:
+        sys.exit("Erreur : l'EZFIO ne contient déjà qu'un seul état.")
 
     psi_coef = ezfio.get_determinants_psi_coef()
 
@@ -134,8 +139,8 @@ def main():
     ezfio.set_determinants_psi_coef(block)
     ezfio.set_determinants_state_average_weight([1.0 / k] * k)
     ezfio.set_determinants_read_wf(True)
-    print(f"OK : {args.ezfio_dir} contient maintenant {k} états "
-          f"(anciens états {keep}), read_wf=True.")
+    print(f"OK : {args.ezfio_dir} contient maintenant {k} état(s) "
+          f"(ancien(s) état(s) {keep}), read_wf=True.")
     print(f"Le nouvel indice de chaque état est sa position dans la liste : "
           f"{ {old: new + 1 for new, old in enumerate(keep)} }")
 
