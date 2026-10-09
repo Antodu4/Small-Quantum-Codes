@@ -15,6 +15,19 @@ La sortie QP2 contient plusieurs scans de theta : chacun correspond à une étap
     stationnaire de la trajectoire) = résonance (critère de Moiseyev).
     E_res = E(theta_min),  Gamma = -2 Im E_res.
  4. Compare les étapes de convergence, exporte les énergies, trace les graphiques.
+
+Exemples d'utilisation courants :
+  # Analyse complète par défaut (toutes les étapes)
+  python cs_resonance.py He_cs.out
+
+  # Tracer les trajectoires et la vélocité de l'étape 3 sur l'intervalle θ ∈ [0.150, 0.250] rad
+  python cs_resonance.py He_cs.out --step 3 --plot --theta-range 0.150 0.250
+
+  # Afficher uniquement le point à θ = 0.200 rad (ou la valeur la plus proche)
+  python cs_resonance.py He_cs.out --step last --plot --theta-range 0.200
+
+  # Masquer les points rouges des résonances et décaler/masquer la légende
+  python cs_resonance.py He_cs.out --step last --plot --no-resonances --no-legend
 """
 import argparse
 import os
@@ -23,7 +36,7 @@ import re
 import numpy as np
 from scipy.interpolate import CubicSpline
 from scipy.optimize import linear_sum_assignment
-from scipy.signal import argrelmin
+
 
 HARTREE_TO_EV = 27.211386245988
 
@@ -40,7 +53,6 @@ def parse_cs_energies(path):
     i = 0
     while i < len(lines):
         if "CS energies" in lines[i]:
-            # on avance jusqu'aux lignes de données (commencent par un theta en notation E)
             j = i + 1
             rows = []
             while j < len(lines):
@@ -58,7 +70,6 @@ def parse_cs_energies(path):
         i += 1
     if not scans:
         raise RuntimeError("Aucun tableau 'CS energies' trouvé dans le fichier.")
-    # nombre de déterminants de chaque étape (ligne "Saved determinants")
     ndets = [int(m.group(1)) for l in lines
              if (m := re.match(r"\*\s*Saved determinants\s+(\d+)", l))]
     for k, sc in enumerate(scans):
@@ -113,19 +124,12 @@ def velocity(theta, Etraj, logderiv=False, nfine=20):
 def find_resonances(theta, T, threshold=None, logderiv=False, theta_min=0.0,
                     imag_tol=None, prominence=0.0, nfine=20):
     """
-    Minima locaux de la vitesse. Tous les filtres sont optionnels (None/0 = désactivé) :
-    threshold  : ne garde que Re E > threshold
-    theta_min  : ignore les minima à theta < theta_min
-    imag_tol   : ne garde que Im E < -imag_tol (états avec une largeur)
-    prominence : profondeur minimale du minimum, en fraction de la vitesse médiane
-                 (sinon c'est juste du bruit sur une courbe plate).
-    Les trajectoires dégénérées (même E à 1e-5 Ha) sont regroupées (multiplicité).
+    Minima locaux de la vitesse. Tous les filtres sont optionnels.
     """
     from scipy.signal import find_peaks
     out = []
     for n in range(T.shape[1]):
         tf, v, Ef = velocity(theta, T[:, n], logderiv, nfine)
-        # on cherche les pics de -v, avec prominence relative
         pk, props = find_peaks(-v, prominence=prominence * np.median(v))
         for i in pk:
             Er = Ef[i]
@@ -138,7 +142,6 @@ def find_resonances(theta, T, threshold=None, logderiv=False, theta_min=0.0,
             out.append(dict(traj=n + 1, theta=tf[i], v=v[i], E=Er, Gamma=-2 * Er.imag,
                             depth=props["prominences"][list(pk).index(i)] / np.median(v),
                             mult=1))
-    # regroupement des dégénérescences
     merged = []
     for r in sorted(out, key=lambda r: r["v"]):
         for m in merged:
@@ -175,7 +178,7 @@ def save_csv(outdir, s, theta, T, V):
     return path
 
 
-def make_plots(outdir, s, theta, T, V, res, threshold, logderiv):
+def make_plots(outdir, s, theta, T, V, res, threshold, logderiv, show_resonances=True, show_legend=True):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -186,10 +189,11 @@ def make_plots(outdir, s, theta, T, V, res, threshold, logderiv):
     fig, ax = plt.subplots(figsize=(8, 6))
     for n in range(T.shape[1]):
         ax.plot(T[:, n].real, T[:, n].imag, "-", lw=1, alpha=.7)
-    for r in res:
-        ax.plot(r["E"].real, r["E"].imag, "ro", ms=7)
-        ax.annotate(f"{r['traj']}", (r["E"].real, r["E"].imag), fontsize=8,
-                    xytext=(4, 4), textcoords="offset points")
+    if show_resonances:
+        for r in res:
+            ax.plot(r["E"].real, r["E"].imag, "ro", ms=7)
+            ax.annotate(f"{r['traj']}", (r["E"].real, r["E"].imag), fontsize=8,
+                        xytext=(4, 4), textcoords="offset points")
     if threshold is not None:
         ax.axvline(threshold, color="k", ls=":", lw=.8)
         ax.set_xlim(left=max(threshold - 0.3, T.real.min()))
@@ -200,21 +204,23 @@ def make_plots(outdir, s, theta, T, V, res, threshold, logderiv):
     fig.savefig(os.path.join(outdir, f"step{s}_complex_plane.png"), dpi=150)
     plt.close(fig)
 
-    # (b) vélocité (états au-dessus du seuil)
+    # (b) vélocité
     fig, ax = plt.subplots(figsize=(8, 6))
     for n in range(T.shape[1]):
         tf, v, Ef = velocity(theta, T[:, n], logderiv)
         if threshold is not None and Ef.real.max() <= threshold:
             continue
         ax.semilogy(tf, v, lw=1, label=f"traj {n+1}")
-    for r in res:
-        ax.plot(r["theta"], r["v"], "ro", ms=6)
+    if show_resonances:
+        for r in res:
+            ax.plot(r["theta"], r["v"], "ro", ms=6)
     ax.set_xlabel(r"$\theta$ (rad)")
     ax.set_ylabel(ylab + " (Ha/rad)")
     ax.set_title(f"Étape {s} : vélocité")
-    ax.legend(fontsize=6, ncol=3)
+    if show_legend:
+        ax.legend(title="trajectoire", fontsize=7, bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
     fig.tight_layout()
-    fig.savefig(os.path.join(outdir, f"step{s}_velocity.png"), dpi=150)
+    fig.savefig(os.path.join(outdir, f"step{s}_velocity.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -233,47 +239,92 @@ def parse_states(spec, n):
 
 
 def make_side_by_side(outdir, s, theta, T, res, threshold, logderiv, states,
-                      show=False, ylog=True):
-    """Figure à 2 panneaux : trajectoires dans le plan complexe | vélocité vs theta.
-    Même couleur par trajectoire sur les deux panneaux ; les états dégénérés
-    (mêmes E à 1e-5 Ha à tout theta) sont tracés une seule fois."""
+                      show=False, ylog=True, xlim=None, ylim=None,
+                      theta_range=None, show_resonances=True, show_legend=True):
+    """Figure à 2 panneaux : trajectoires dans le plan complexe | vélocité vs theta."""
     import matplotlib
     if not show:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    # regroupe les trajectoires dégénérées
+    # Sélection de la fenêtre ou d'un seul point de theta
+    single_point = False
+    if theta_range is not None:
+        if len(theta_range) == 1:
+            th_target = theta_range[0]
+            idx_closest = np.argmin(np.abs(theta - th_target))
+            theta_sub = theta[idx_closest:idx_closest + 1]
+            T_sub = T[idx_closest:idx_closest + 1, :]
+            single_point = True
+            th_min, th_max = theta_sub[0], theta_sub[0]
+        else:
+            th_min, th_max = theta_range
+            mask = (theta >= th_min) & (theta <= th_max)
+            if not np.any(mask):
+                raise ValueError(f"Aucune valeur de theta trouvée dans l'intervalle [{th_min}, {th_max}]")
+            theta_sub = theta[mask]
+            T_sub = T[mask, :]
+    else:
+        theta_sub = theta
+        T_sub = T
+
     groups = []
     for n in states:
         for g in groups:
-            if np.max(np.abs(T[:, g[0] - 1] - T[:, n - 1])) < 1e-4:
+            if np.max(np.abs(T_sub[:, g[0] - 1] - T_sub[:, n - 1])) < 1e-4:
                 g.append(n)
                 break
         else:
             groups.append([n])
 
     cmap = plt.get_cmap("tab20")
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
     for k, g in enumerate(groups):
         n = g[0]
         c = cmap(k % 20)
         lab = ",".join(map(str, g)) if len(g) <= 3 else f"{g[0]}-{g[-1]}"
-        E = T[:, n - 1]
-        ax1.plot(E.real, E.imag, "-", color=c, lw=1.4, label=lab)
-        ax1.plot(E.real[0], E.imag[0], "o", color=c, ms=4)            # theta = 0
-        ax1.plot(E.real[-1], E.imag[-1], ">", color=c, ms=6)          # theta max
-        tf, v, _ = velocity(theta, E, logderiv)
-        ax2.plot(tf, v, "-", color=c, lw=1.4, label=lab)
-    for r in res:
-        ax1.plot(r["E"].real, r["E"].imag, "r*", ms=14, zorder=5)
-        ax2.plot(r["theta"], r["v"], "r*", ms=14, zorder=5)
+        E = T_sub[:, n - 1]
+        
+        if single_point:
+            # Affichage d'un seul point
+            ax1.plot(E.real[0], E.imag[0], "o", color=c, ms=6, label=lab)
+            tf, v, _ = velocity(theta, T[:, n - 1], logderiv)
+            v_pt = np.interp(theta_sub[0], tf, v)
+            ax2.plot(theta_sub[0], v_pt, "o", color=c, ms=6, label=lab)
+        else:
+            ax1.plot(E.real, E.imag, "-", color=c, lw=1.4, label=lab)
+            ax1.plot(E.real[0], E.imag[0], "o", color=c, ms=4)            # début de l'intervalle
+            ax1.plot(E.real[-1], E.imag[-1], ">", color=c, ms=6)          # fin de l'intervalle
+            tf, v, _ = velocity(theta_sub, E, logderiv)
+            ax2.plot(tf, v, "-", color=c, lw=1.4, label=lab)
+
+    if show_resonances:
+        sel = set(states)
+        for r in res:
+            if not (set(int(t) for t in str(r["traj"]).split(",")) & sel):
+                continue
+            if theta_range is not None:
+                if single_point:
+                    if abs(r["theta"] - theta_sub[0]) > 1e-3:
+                        continue
+                elif not (th_min <= r["theta"] <= th_max):
+                    continue
+            ax1.plot(r["E"].real, r["E"].imag, "ro", ms=5, zorder=5)
+            ax2.plot(r["theta"], r["v"], "ro", ms=5, zorder=5)
 
     if threshold is not None:
         ax1.axvline(threshold, color="k", ls=":", lw=.8)
     ax1.axhline(0, color="gray", lw=.5)
+    if xlim is not None:
+        ax1.set_xlim(*xlim)
+    if ylim is not None:
+        ax1.set_ylim(*ylim)
     ax1.set_xlabel("Re E (Ha)")
     ax1.set_ylabel("Im E (Ha)")
-    ax1.set_title(f"Étape {s} : trajectoires E(θ)   (● θ=0, ▶ θ max)")
+    if single_point:
+        ax1.set_title(f"Étape {s} : états à θ = {theta_sub[0]:.4f} rad")
+    else:
+        ax1.set_title(f"Étape {s} : trajectoires E(θ)   (● θ min, ▶ θ max)")
     ax1.grid(alpha=.3)
 
     ax2.set_xlabel(r"$\theta$ (rad)")
@@ -282,11 +333,13 @@ def make_side_by_side(outdir, s, theta, T, res, threshold, logderiv, states,
         ax2.set_yscale("log")
     ax2.set_title("Vélocité")
     ax2.grid(alpha=.3, which="both")
-    ax2.legend(title="trajectoire", fontsize=7, ncol=2, loc="best")
+
+    if show_legend:
+        ax2.legend(title="trajectoire", fontsize=7, bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
 
     fig.tight_layout()
     path = os.path.join(outdir, f"step{s}_trajectories_velocity.png")
-    fig.savefig(path, dpi=150)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     if show:
         plt.show()
     plt.close(fig)
@@ -303,7 +356,7 @@ def select_states(spec, erange, T):
 
 
 def group_degenerate(T, states, tol=1e-4):
-    """Regroupe les trajectoires confondues (états dégénérés) -> liste de listes."""
+    """Regroupe les trajectoires confondues -> liste de listes."""
     groups = []
     for n in states:
         for g in groups:
@@ -316,12 +369,7 @@ def group_degenerate(T, states, tol=1e-4):
 
 
 def export_energies(outdir, s, ndet, theta, T, E_sorted, states, order):
-    """
-    Fichier texte : une ligne par theta, colonnes Re/Im de chaque état choisi (Ha).
-      order='tracked' : colonnes = trajectoires (suivies par continuité,
-                        numérotées par l'état à theta=0)
-      order='sorted'  : colonnes = états dans l'ordre brut de QP2 (tri par Re E)
-    """
+    """Fichier texte : une ligne par theta, colonnes Re/Im de chaque état choisi (Ha)."""
     data = T if order == "tracked" else E_sorted
     path = os.path.join(outdir, f"step{s}_energies.dat")
     cols = []
@@ -342,13 +390,8 @@ def export_energies(outdir, s, ndet, theta, T, E_sorted, states, order):
 
 
 def make_rotation_plot(outdir, tag, runs, threshold, states, show=False,
-                       theta_marks=0.1, xlim=None, ylim=None, labels=True):
-    """
-    Rotation des états dans le plan complexe.
-    runs : liste de (nom_étape, theta, T). Plusieurs entrées => superposition
-    (comparaison des étapes : style de trait différent par étape).
-    Les points ◦ le long des courbes marquent les theta multiples de theta_marks.
-    """
+                       theta_marks=0.1, xlim=None, ylim=None, labels=True, show_legend=True):
+    """Rotation des états dans le plan complexe."""
     import matplotlib
     if not show:
         matplotlib.use("Agg")
@@ -370,7 +413,6 @@ def make_rotation_plot(outdir, tag, runs, threshold, states, show=False,
             ax.plot(E.real, E.imag, ls, color=c, lw=1.4,
                     label=lab if r == len(runs) - 1 else None)
             if r == len(runs) - 1:
-                # repères en theta
                 idx = [i for i, th in enumerate(theta)
                        if abs(th / theta_marks - round(th / theta_marks)) < 1e-6]
                 ax.plot(E.real[idx], E.imag[idx], "o", color=c, ms=3.5)
@@ -393,18 +435,21 @@ def make_rotation_plot(outdir, tag, runs, threshold, states, show=False,
     ax.set_title(f"Rotation des états dans le plan complexe ({names})\n"
                  f"■ θ=0   ● tous les {theta_marks} rad   ▶ θ max")
     ax.grid(alpha=.3)
-    if len(runs) > 1:
-        from matplotlib.lines import Line2D
-        h, l = ax.get_legend_handles_labels()
-        for r, (name, _, _) in enumerate(runs):
-            h.append(Line2D([0], [0], color="k", ls=styles[r % len(styles)]))
-            l.append(name)
-        ax.legend(h, l, fontsize=7, ncol=2, title="états / étapes")
-    else:
-        ax.legend(fontsize=7, ncol=2, title="état")
+
+    if show_legend:
+        if len(runs) > 1:
+            from matplotlib.lines import Line2D
+            h, l = ax.get_legend_handles_labels()
+            for r, (name, _, _) in enumerate(runs):
+                h.append(Line2D([0], [0], color="k", ls=styles[r % len(styles)]))
+                l.append(name)
+            ax.legend(h, l, fontsize=7, bbox_to_anchor=(1.02, 1), loc="upper left", title="états / étapes", borderaxespad=0.)
+        else:
+            ax.legend(fontsize=7, bbox_to_anchor=(1.02, 1), loc="upper left", title="état", borderaxespad=0.)
+
     fig.tight_layout()
     path = os.path.join(outdir, f"{tag}_rotation.png")
-    fig.savefig(path, dpi=150)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     if show:
         plt.show()
     plt.close(fig)
@@ -414,7 +459,6 @@ def make_rotation_plot(outdir, tag, runs, threshold, states, show=False,
 # --------------------------------------------------------------------------- #
 def main():
     class Fmt(argparse.RawDescriptionHelpFormatter):
-        """Affiche (défaut : x) seulement quand le défaut est informatif."""
         def _get_help_string(self, action):
             h = action.help or ""
             if action.default not in (None, False, 0.0, argparse.SUPPRESS) \
@@ -423,30 +467,17 @@ def main():
             return h
 
     epilog = """exemples :
-  # analyse complète de toutes les étapes (résonances + rapport de convergence)
+  # Analyse complète de toutes les étapes (résonances + rapport de convergence)
   python cs_resonance.py He_cs.out
 
-  # étape convergée seulement, avec diagnostic de vitesse par trajectoire
-  python cs_resonance.py He_cs.out --step last --diag
+  # Sélectionner une fenêtre de theta [0.150, 0.250] rad
+  python cs_resonance.py He_cs.out --step last --plot --states 7-20 --theta-range 0.150 0.250
 
-  # exporter les énergies de l'étape 3 (un fichier .dat, une ligne par theta)
-  python cs_resonance.py He_cs.out --step 3 --export-energies
+  # Sélectionner UN SEUL point de theta (ex. 0.200 rad)
+  python cs_resonance.py He_cs.out --step last --plot --states 7-20 --theta-range 0.200
 
-  # rotation dans le plan complexe des états 1, 2 et 7 à 20
-  python cs_resonance.py He_cs.out --step 3 --rotation --states 1,2,7-20
-
-  # idem avec une fenêtre d'énergie, zoom, et comparaison des 3 étapes
-  python cs_resonance.py He_cs.out --rotation --compare --erange -2.1 -0.9 --xlim -2.2 -0.9
-
-  # figure à 2 panneaux : plan complexe | vélocité
-  python cs_resonance.py He_cs.out --step last --plot --states 7-20
-
-sorties (dans --outdir) :
-  stepN_trajectories.csv           trajectoires + vitesse (format long)
-  stepN_energies.dat               énergies par theta (--export-energies)
-  stepN_rotation.png               rotation dans le plan complexe (--rotation)
-  steps_1-2-3_rotation.png         comparaison des étapes (--rotation --compare)
-  stepN_trajectories_velocity.png  plan complexe | vélocité (--plot)
+  # Masquer les points rouges des résonances et désactiver la légende
+  python cs_resonance.py He_cs.out --step last --plot --states 7-20 --no-resonances --no-legend
 """
     p = argparse.ArgumentParser(prog="cs_resonance.py", description=__doc__,
                                 epilog=epilog, formatter_class=Fmt)
@@ -457,62 +488,59 @@ sorties (dans --outdir) :
 
     g = p.add_argument_group("sélection des étapes et des états")
     g.add_argument("--step", default="all", metavar="N|last|all",
-                   help="étape(s) de convergence à traiter : 'all', 'last' "
-                        "(étape convergée) ou un numéro (1, 2, 3...)")
+                   help="étape(s) de convergence à traiter : 'all', 'last' ou un numéro")
     g.add_argument("--states", default=None, metavar="LISTE",
-                   help="trajectoires à exporter/tracer, ex. '1,3,15-17' "
-                        "(défaut : toutes)")
+                   help="trajectoires à exporter/tracer, ex. '1,3,15-17'")
     g.add_argument("--erange", type=float, nargs=2, metavar=("EMIN", "EMAX"),
-                   help="ne garde que les états dont Re E(theta=0) est dans "
-                        "[EMIN, EMAX] (Ha) ; se combine avec --states")
+                   help="ne garde que les états dont Re E(theta=0) est dans [EMIN, EMAX]")
 
     g = p.add_argument_group("recherche de résonance (vélocité)")
     g.add_argument("--threshold", type=float, default=None, metavar="E",
-                   help="seuil d'ionisation (Ha), ex. -2.0 pour He+ 1s : ne garde que "
-                        "les minima avec Re E > E (défaut : désactivé)")
+                   help="seuil d'ionisation (Ha)")
     g.add_argument("--logderiv", action="store_true",
                    help="vélocité = |theta dE/dtheta| au lieu de |dE/dtheta|")
     g.add_argument("--theta-min", type=float, default=0.0, metavar="TH",
-                   help="ignore les minima à theta < TH (rad) (défaut : 0 = désactivé)")
+                   help="ignore les minima à theta < TH (rad)")
     g.add_argument("--prominence", type=float, default=0.0, metavar="P",
-                   help="profondeur minimale d'un minimum de vitesse, en fraction "
-                        "de la vitesse médiane ; ex. 0.2 (défaut : 0 = désactivé)")
+                   help="profondeur minimale d'un minimum de vitesse")
     g.add_argument("--imag-tol", type=float, default=None, metavar="G",
-                   help="ne garde que les minima avec Im E < -G (états ayant une "
-                        "largeur), ex. 1e-4 (défaut : désactivé)")
+                   help="ne garde que les minima avec Im E < -G")
     g.add_argument("--diag", action="store_true",
                    help="affiche la vitesse minimale de chaque trajectoire")
 
     g = p.add_argument_group("export de données")
     g.add_argument("--export-energies", action="store_true",
-                   help="écrit stepN_energies.dat : Re/Im de l'énergie de chaque "
-                        "état pour chaque theta, pour l'étape choisie")
+                   help="écrit stepN_energies.dat")
     g.add_argument("--order", choices=["tracked", "sorted"], default="tracked",
-                   help="colonnes de l'export : trajectoires suivies par continuité "
-                        "('tracked') ou états dans l'ordre brut de QP2 ('sorted')")
+                   help="colonnes de l'export")
 
     g = p.add_argument_group("graphiques")
     g.add_argument("--rotation", action="store_true",
                    help="rotation des états dans le plan complexe")
     g.add_argument("--compare", action="store_true",
-                   help="avec --rotation : superpose les étapes choisies sur un "
-                        "seul graphique")
+                   help="superpose les étapes choisies sur un seul graphique")
     g.add_argument("--plot", action="store_true",
                    help="figure à 2 panneaux : plan complexe | vélocité(theta)")
     g.add_argument("--theta-marks", type=float, default=0.1, metavar="PAS",
                    help="pas (rad) des repères en theta sur la rotation")
+    g.add_argument("--theta-range", type=float, nargs="+", metavar="THETA",
+                   help="un seul theta ou intervalle à afficher, ex. --theta-range 0.200 ou 0.150 0.250")
+    g.add_argument("--no-resonances", action="store_true",
+                   help="masque les points rouges indiquant les résonances")
+    g.add_argument("--no-legend", action="store_true",
+                   help="desactive complètement l'affichage de la légende")
     g.add_argument("--xlim", type=float, nargs=2, metavar=("XMIN", "XMAX"),
-                   help="bornes de l'axe Re E de la rotation")
+                   help="bornes de l'axe Re E")
     g.add_argument("--ylim", type=float, nargs=2, metavar=("YMIN", "YMAX"),
-                   help="bornes de l'axe Im E de la rotation")
+                   help="bornes de l'axe Im E")
     g.add_argument("--no-labels", action="store_true",
-                   help="pas d'étiquettes d'état sur la rotation")
+                   help="pas d'étiquettes d'état")
     g.add_argument("--linear-v", action="store_true",
-                   help="axe de vélocité linéaire (défaut : logarithmique)")
+                   help="axe de vélocité linéaire")
     g.add_argument("--show", action="store_true",
-                   help="ouvre aussi la fenêtre matplotlib (en plus du PNG)")
+                   help="ouvre la fenêtre matplotlib")
     g.add_argument("--no-plot", action="store_true",
-                   help="désactive les figures par défaut (plan complexe / vélocité)")
+                   help="désactive les figures par défaut")
 
     a = p.parse_args()
 
@@ -521,7 +549,6 @@ sorties (dans --outdir) :
     print(f"{len(scans)} étape(s) de convergence trouvée(s) ; "
           f"{len(scans[0]['theta'])} valeurs de theta, {scans[0]['E'].shape[1]} états")
 
-    # trajectoires de toutes les étapes (pour le rapport de convergence)
     allT = [track_trajectories(sc["theta"], sc["E"]) for sc in scans]
     if len(scans) > 1:
         print("\n=== Convergence entre étapes ===")
@@ -577,14 +604,21 @@ sorties (dans --outdir) :
             png = make_rotation_plot(a.outdir, f"step{s}", [(f"étape {s}", theta, T)],
                                      a.threshold, st, show=a.show,
                                      theta_marks=a.theta_marks, xlim=a.xlim,
-                                     ylim=a.ylim, labels=not a.no_labels)
+                                     ylim=a.ylim, labels=not a.no_labels,
+                                     show_legend=not a.no_legend)
             print(f"  figure rotation : {png}")
         if a.plot:
             png = make_side_by_side(a.outdir, s, theta, T, res, a.threshold,
-                                    a.logderiv, st, show=a.show, ylog=not a.linear_v)
+                                    a.logderiv, st, show=a.show, ylog=not a.linear_v,
+                                    xlim=a.xlim, ylim=a.ylim,
+                                    theta_range=a.theta_range,
+                                    show_resonances=not a.no_resonances,
+                                    show_legend=not a.no_legend)
             print(f"  figure : {png}")
         if not a.no_plot and not a.plot and not a.rotation:
-            make_plots(a.outdir, s, theta, T, V, res, a.threshold, a.logderiv)
+            make_plots(a.outdir, s, theta, T, V, res, a.threshold, a.logderiv,
+                       show_resonances=not a.no_resonances,
+                       show_legend=not a.no_legend)
 
     if a.rotation and a.compare:
         runs = [(f"étape {k}", scans[k - 1]["theta"], allT[k - 1]) for k in todo]
@@ -592,7 +626,8 @@ sorties (dans --outdir) :
         tag = "steps_" + "-".join(str(k) for k in todo)
         png = make_rotation_plot(a.outdir, tag, runs, a.threshold, st, show=a.show,
                                  theta_marks=a.theta_marks, xlim=a.xlim,
-                                 ylim=a.ylim, labels=not a.no_labels)
+                                 ylim=a.ylim, labels=not a.no_labels,
+                                 show_legend=not a.no_legend)
         print(f"\nfigure comparaison des étapes : {png}")
 
 
