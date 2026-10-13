@@ -11,8 +11,26 @@ Fonctionnalités
   E variationnelle, S^2, variance, PT2, rPT2, E+PT2, E+rPT2.
 * Affichage des énergies convergées dans le shell (--energies).
 * Affichage du tableau de convergence (--table).
+* Création d'un dossier de résultats : 2 CSV (convergence par état/étape, énergies
+  extrapolées par QP) et les graphiques.
 * Énergies extrapolées FCI telles que calculées par QP (dernier bloc « Extrapolated energies »).
 * Graphique de convergence d'un ou plusieurs états en fonction de N_det (--plot).
+
+Grandeurs tracées (option --quantity)
+-------------------------------------
+Ce sont les valeurs lues telles quelles dans la sortie de QP (blocs « Summary at
+N_det » et « * State k ») ; le script n'en recalcule aucune.
+
+    evar   E_var   ligne « E » : énergie variationnelle de la fonction d'onde à
+                   N_det déterminants.
+    ept2   E+PT2   ligne « E+PT2 » : énergie variationnelle + correction PT2.
+    erpt2  E+rPT2  ligne « E+rPT2 » : énergie variationnelle + correction rPT2
+                   (PT2 renormalisée, « rPT2 » dans la sortie de QP).
+    Mode excitation : valeurs « Excit. (eV) » des tableaux Summary de QP (evar :
+    excitation de E_var ; ept2 : second groupe de lignes « Excit. », qui correspond à
+    E+PT2). QP n'en donne pas pour E+rPT2 ni pour la dernière diagonalisation.
+    E+PT2 et E+rPT2 n'existent qu'aux étapes où QP a calculé la PT2 : pas pour la
+    dernière diagonalisation, qui ne fournit que E_var.
 
 Exemples
 --------
@@ -29,6 +47,7 @@ Dépendances : numpy, matplotlib
 """
 
 import argparse
+import csv
 import math
 import os
 import re
@@ -44,6 +63,8 @@ HARTREE_TO_EV = 27.211386245988
 _FLOAT = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[EeDd][-+]?\d+)?"
 
 RE_NDET_BLOCK = re.compile(r"^\s*N_det\s*=\s*(\d+)")
+RE_SUMMARY_AT = re.compile(r"^Summary at N_det\s*=\s*(\d+)")
+RE_SUMMARY_STATES = re.compile(r"State\s+(\d+)")
 RE_STATE_BLOCK = re.compile(r"^\s*\*\s*State\s+(\d+)\s*$")
 RE_FIELD = re.compile(
     r"^\s*(< S\^2 >|E\+rPT2|E\+PT2|rPT2|PT2|PT norm|Variance|E)\s*=\s*(" + _FLOAT + r")"
@@ -87,6 +108,9 @@ def parse_qp_output(path):
     cur_state = None      # état en cours de lecture dans un bloc Summary
     last_num_det = 1      # dernier « Number of determinants » vu
     pending = {}          # {état: (E, S2)} en attente de leur N_det
+    sum_ndet = None       # N_det du tableau « # » d'un bloc Summary en cours de lecture
+    sum_states = None     # états (colonnes) de ce tableau
+    grp = None            # groupe de lignes « Excit. » en cours : "evar" ou "ept2"
 
     def flush_pending(ndet):
         for st, vals in pending.items():
@@ -98,11 +122,49 @@ def parse_qp_output(path):
 
     with open(path, "r", errors="replace") as fh:
         for line in fh:
+            # -- tableau récapitulatif « # » (énergies d'excitation de QP) ------
+            m = RE_SUMMARY_AT.match(line)
+            if m:
+                sum_ndet, sum_states, grp = int(m.group(1)), None, None
+                continue
+            if sum_ndet is not None:
+                txt = line.strip()
+                if txt.startswith("State"):
+                    sum_states = [int(x) for x in RE_SUMMARY_STATES.findall(txt)]
+                    grp = None
+                    continue
+                if txt.startswith("#") and sum_states:
+                    tok = txt.split()
+                    if len(tok) > 1:
+                        if tok[1] == "E":
+                            grp = "evar"
+                        elif tok[1] in ("E+PT2", "E+rPT2"):
+                            grp = "ept2"
+                        elif tok[1] == "Excit." and grp and len(tok) > 2 \
+                                and tok[2] in ("(au)", "(eV)"):
+                            unit = "au" if tok[2] == "(au)" else "ev"
+                            try:
+                                vals = [_f(t) for t in tok[3:]]
+                            except ValueError:
+                                vals = []
+                            n = len(sum_states)
+                            if grp == "evar" and len(vals) == n:
+                                use = vals                 # une valeur par état
+                            elif grp == "ept2" and len(vals) == 2 * n:
+                                use = vals[0::2]           # (valeur, erreur) par état
+                            else:
+                                use = None
+                            for st, v in zip(sum_states, use or []):
+                                data.setdefault(sum_ndet, {}).setdefault(st, {})[
+                                    f"exc_{unit}_{grp}"] = v
+                    continue
+
             # -- blocs Summary --------------------------------------------------
             m = RE_NDET_BLOCK.match(line)
             if m:
                 cur_ndet = int(m.group(1))
                 cur_state = None
+                sum_ndet = None
                 continue
 
             if cur_ndet is not None:
@@ -253,6 +315,54 @@ def parse_states(tokens, available):
 # --------------------------------------------------------------------------- #
 #  Affichage shell
 # --------------------------------------------------------------------------- #
+# (clé interne, nom de colonne) dans l'ordre d'écriture du CSV de convergence
+CSV_COLUMNS = [("evar", "E_var_Ha"), ("ept2", "E+PT2_Ha"), ("erpt2", "E+rPT2_Ha"),
+               ("exc_au_evar", "Excit_E_var_au"), ("exc_ev_evar", "Excit_E_var_eV"),
+               ("exc_au_ept2", "Excit_E+PT2_au"), ("exc_ev_ept2", "Excit_E+PT2_eV"),
+               ("pt2", "PT2_Ha"), ("rpt2", "rPT2_Ha"), ("ptnorm", "PT_norm"),
+               ("var", "Variance"), ("s2", "S2")]
+
+
+def write_csv_convergence(data, path):
+    """
+    CSV de convergence : une ligne par (état, étape), trié par état puis par
+    nombre croissant de déterminants, de sorte que l'évolution de chaque état
+    forme un bloc continu. Les valeurs absentes sont écrites « NaN » (lisible par
+    pandas, numpy, R, ...). « Step » est le numéro de l'étape d'ajout de
+    déterminants (1 = fonction d'onde initiale), commun à tous les états.
+    """
+    step_of = {ndet: i for i, ndet in enumerate(sorted(data), start=1)}
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(["State", "Step", "N_det"] + [name for _, name in CSV_COLUMNS])
+        for st in all_states(data):
+            for ndet in sorted(data):
+                d = data[ndet].get(st)
+                if not d:
+                    continue
+                w.writerow([st, step_of[ndet], ndet]
+                           + [repr(d[k]) if k in d else "NaN" for k, _ in CSV_COLUMNS])
+
+
+def write_csv_extrapolation(extrap, row, path):
+    """
+    CSV des énergies extrapolées (FCI) fournies par QP : une ligne par état et par
+    seuil « minimum PT2 ». « Selected » = 1 pour la ligne choisie (--extrap-row).
+    Les valeurs absentes de la sortie de QP (excitation de l'état 1) sont écrites NaN.
+    """
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(["State", "Row", "PT2_min", "E_extrap_Ha", "Excit_au", "Excit_eV",
+                    "Selected"])
+        for st in sorted(extrap):
+            rows = extrap[st]
+            sel = min(row, len(rows)) if rows else None
+            for i, (pt2min, e, ex_au, ex_ev) in enumerate(rows, start=1):
+                w.writerow([st, i, repr(pt2min), repr(e),
+                            "NaN" if ex_au is None else repr(ex_au),
+                            "NaN" if ex_ev is None else repr(ex_ev), int(i == sel)])
+
+
 def print_energies(data, states, extrap, row):
     ndet_max = max(data)
     print()
@@ -283,16 +393,11 @@ def print_energies(data, states, extrap, row):
         r = qp_extrap_value(extrap, st, row)
         ex = r[1] if r else None
         pmin = r[0] if r else None
-        if r is None:
-            de = None
-        elif r[3] is not None:
-            de = r[3]          # excitation fournie par QP
-        else:
-            de = 0.0 if st == 1 else None
+        de = r[3] if r else None   # excitation telle que fournie par QP (absente pour l'état 1)
         print(f"{st:>5} {fmt(s2, '{:10.2e}', 10)} {fmt(ev)} {fmt(ep)} {fmt(ex, '{:18.8f}')} "
               f"{fmt(pmin, '{:8.4f}', 8)} {fmt(de, '{:10.4f}', 10)}")
     print("=" * 99)
-    print("  ΔE : énergie d'excitation par rapport à l'état 1, d'après l'extrapolation de QP.")
+    print("  ΔE : énergie d'excitation donnée par QP dans son tableau d'extrapolation (absente pour l'état 1).")
     print()
 
 
@@ -324,6 +429,8 @@ def print_table(data, states, ndet_min=None, ndet_max=None):
 # --------------------------------------------------------------------------- #
 #  Graphique
 # --------------------------------------------------------------------------- #
+# grandeur -> clé de l'énergie d'excitation (eV) fournie par QP (aucune pour erpt2)
+EXC_KEY = {"evar": "exc_ev_evar", "ept2": "exc_ev_ept2"}
 QUANTITY_LABEL = {"evar": "E$_{var}$", "ept2": "E+PT2", "erpt2": "E+rPT2"}
 QUANTITY_STYLE = {"evar": ("o", "-"), "ept2": ("s", "--"), "erpt2": ("^", ":")}
 
@@ -350,17 +457,11 @@ def make_plot(data, states, quantities, mode, logx, logy, extrap, row, output, s
                 ref = vals.min() if len(vals) else None
 
         for q in quantities:
-            x, y = series(data, st, q)
+            # mode excitation : valeurs « Excit. (eV) » lues dans les tableaux Summary
+            x, y = series(data, st, EXC_KEY[q] if mode == "excitation" else q)
             if len(x) == 0:
                 continue
-            if mode == "excitation":
-                x1, y1 = series(data, 1, q)
-                common = np.intersect1d(x, x1)
-                if len(common) == 0:
-                    continue
-                y = np.array([y[x == c][0] - y1[x1 == c][0] for c in common]) * HARTREE_TO_EV
-                x = common
-            elif mode == "relative":
+            if mode == "relative":
                 if ref is None:
                     continue
                 y = (y - ref) * 1000.0  # mHa
@@ -382,12 +483,15 @@ def make_plot(data, states, quantities, mode, logx, logy, extrap, row, output, s
     ax.set_xlabel("Nombre de déterminants")
     if logx:
         ax.set_xscale("log")
+    # Grandeur affichée : nom précis si une seule, « E » générique sinon (la
+    # légende distingue alors les grandeurs).
+    qlab = QUANTITY_LABEL[quantities[0]] if len(quantities) == 1 else "E"
     if mode == "absolute":
-        ax.set_ylabel("Énergie (Ha)")
+        ax.set_ylabel(f"{qlab} (Ha)")
     elif mode == "relative":
-        ax.set_ylabel("E − E$_{extrap}$ (mHa)")
+        ax.set_ylabel(f"{qlab} − E$_{{extrap}}$ (mHa)")
     else:
-        ax.set_ylabel("Énergie d'excitation vs état 1 (eV)")
+        ax.set_ylabel(f"Énergie d'excitation vs état 1, {qlab} (eV)")
     if logy:
         ax.set_yscale("log")
 
@@ -426,11 +530,15 @@ def main():
                    help="trace la convergence en fonction de N_det")
     p.add_argument("-q", "--quantity", nargs="+", default=["evar"],
                    choices=["evar", "ept2", "erpt2"],
-                   help="grandeur(s) tracée(s) : evar (variationnelle), ept2, erpt2")
+                   help="grandeur(s) tracée(s), lues dans la sortie de QP : evar = ligne "
+                        "« E » (énergie variationnelle) ; ept2 = ligne « E+PT2 » ; "
+                        "erpt2 = ligne « E+rPT2 » (PT2 renormalisée). "
+                        "Plusieurs valeurs possibles.")
     p.add_argument("-m", "--mode", default="absolute",
                    choices=["absolute", "relative", "excitation"],
                    help="absolute : E(N_det) ; relative : E − E_extrap (QP) en mHa "
-                        "(échelle log) ; excitation : E_i − E_1 en eV")
+                        "(échelle log) ; excitation : énergies d'excitation (eV) lues "
+                        "dans les tableaux Summary de QP (evar, ept2)")
     p.add_argument("--ndet-min", type=int, default=None,
                    help="N_det minimal affiché (graphique et tableau)")
     p.add_argument("--ndet-max", type=int, default=None,
@@ -445,8 +553,12 @@ def main():
     p.add_argument("--extrap-row", type=int, default=1, metavar="N",
                    help="ligne N (1 = première) du tableau d'extrapolation de QP à "
                         "utiliser (défaut : 1 = seuil PT2 le plus petit)")
+    p.add_argument("-d", "--outdir", default=None,
+                   help="dossier de sortie, créé s'il n'existe pas "
+                        "(défaut : <nom_du_fichier>_analysis dans le dossier courant)")
     p.add_argument("-o", "--output", default=None,
-                   help="fichier image de sortie (défaut : <fichier>_convergence.png)")
+                   help="nom du fichier image, placé dans le dossier de sortie "
+                        "(défaut : <fichier>_convergence_<mode>.png)")
     p.add_argument("--show", action="store_true", help="affiche la fenêtre matplotlib")
     p.add_argument("--title", default=None, help="titre du graphique")
     args = p.parse_args()
@@ -481,6 +593,18 @@ def main():
         sys.exit("Erreur : --extrap-row doit être >= 1.")
     extrap = parse_qp_extrapolation(args.outfile)
 
+    # Dossier de sortie + CSV (toutes les données, tous les états)
+    stem = os.path.splitext(os.path.basename(args.outfile))[0]
+    outdir = args.outdir or f"{stem}_analysis"
+    os.makedirs(outdir, exist_ok=True)
+    csv_conv = os.path.join(outdir, f"{stem}_convergence.csv")
+    write_csv_convergence(data, csv_conv)
+    print(f"Convergence enregistrée : {csv_conv}")
+    if extrap:
+        csv_ex = os.path.join(outdir, f"{stem}_extrapolation.csv")
+        write_csv_extrapolation(extrap, args.extrap_row, csv_ex)
+        print(f"Énergies extrapolées enregistrées : {csv_ex}")
+
     if args.energies:
         print_energies(data, states, extrap, args.extrap_row)
     if args.table:
@@ -491,13 +615,15 @@ def main():
             plot_states = [s for s in states if s != 1]
             if not plot_states:
                 sys.exit("Erreur : le mode 'excitation' nécessite au moins un état > 1.")
+        if args.mode == "excitation" and "erpt2" in args.quantity:
+            sys.exit("Erreur : QP ne fournit pas d'énergie d'excitation pour E+rPT2 ; "
+                     "utilise --quantity evar et/ou ept2 en mode excitation.")
         logy = args.logy or (args.mode == "relative" and not args.liny)
         if logy and args.mode == "absolute":
             sys.exit("Erreur : l'échelle log en y est impossible en mode 'absolute' "
                      "(énergies négatives). Utilise --mode relative ou excitation.")
-        output = args.output
-        if output is None and not args.show:
-            output = os.path.splitext(args.outfile)[0] + "_convergence.png"
+        output = os.path.join(
+            outdir, args.output or f"{stem}_convergence_{args.mode}.png")
         title = args.title or f"Convergence CIPSI – {os.path.basename(args.outfile)}"
         make_plot(data, plot_states, args.quantity, args.mode, not args.linx, logy,
                   extrap, args.extrap_row, output, args.show, title,
