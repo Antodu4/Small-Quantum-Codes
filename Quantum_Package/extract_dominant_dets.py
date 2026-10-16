@@ -16,6 +16,7 @@ running qp_edit on a fresh EZFIO to seed a state-following calculation.
 
 import sys
 import os
+import gzip
 import argparse
 import numpy as np
 
@@ -71,6 +72,36 @@ def bitstring_to_occ(s: str) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
+# Fast EZFIO array reader (bypasses ezfio.py's slow line-by-line parser)
+# ---------------------------------------------------------------------------
+
+def read_ezfio_array(ezfio_dir, name, dtype=float):
+    """
+    Read an EZFIO array stored under <ezfio_dir>/determinants/<name>[.gz].
+
+    EZFIO text format:
+        line 1 : rank
+        line 2 : dimensions (space separated, Fortran/column-major order)
+        rest   : flat data
+
+    Returns (dims, flat) where flat is a 1D numpy array parsed in C (orders of
+    magnitude faster than ezfio.py, which converts each line in a Python loop).
+    """
+    base = os.path.join(ezfio_dir, "determinants", name)
+    if os.path.exists(base + ".gz"):
+        path, opener = base + ".gz", gzip.open
+    elif os.path.exists(base):
+        path, opener = base, open
+    else:
+        raise FileNotFoundError(f"{base}[.gz] not found")
+    with opener(path, "rt") as f:
+        f.readline()                                   # rank (unused)
+        dims = [int(x) for x in f.readline().split()]
+        flat = np.array(f.read().split(), dtype=dtype)
+    return dims, flat
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -84,6 +115,12 @@ def main():
     parser.add_argument("state",  type=int, help="Target state (1-based)")
     parser.add_argument("-n", "--ndet", type=int, default=10,
                         help="Number of determinants to extract (default: 10)")
+    parser.add_argument("--full", action="store_true",
+                        help="Read the COMPLETE psi_coef/psi_det arrays instead of the "
+                             "truncated qp_edit ones. Default reads psi_coef_qp_edit / "
+                             "psi_det_qp_edit (n_det_print_wf dominant determinants), which "
+                             "is instantaneous; use --full only if you need determinants "
+                             "beyond the dominant set (much slower for large N_det).")
     parser.add_argument("--renorm", action="store_true",
                         help="Renormalise coefficients within the selected N dets")
     parser.add_argument("--all-states", action="store_true",
@@ -122,23 +159,47 @@ def main():
     if args.state < 1 or args.state > n_states:
         sys.exit(f"ERROR: state {args.state} is out of range [1, {n_states}].")
 
+    istate     = args.state - 1  # 0-based
+    n_det_full = n_det            # complete wavefunction (from metadata)
+    ezfio_dir  = os.path.abspath(args.ezfio)
+
+    # ------------------------------------------------------------------
+    # Read the wavefunction arrays with the fast reader.
+    # Default: truncated qp_edit arrays (n_det_print_wf dominant determinants),
+    #          tiny and sufficient to extract the dominant determinants.
+    # --full : the complete psi_coef/psi_det (still read fast via numpy).
+    # ------------------------------------------------------------------
+    def _has(name):
+        d = os.path.join(ezfio_dir, "determinants")
+        return os.path.exists(os.path.join(d, name + ".gz")) or \
+               os.path.exists(os.path.join(d, name))
+
+    use_edit  = (not args.full) and _has("psi_coef_qp_edit") and _has("psi_det_qp_edit")
+    coef_name = "psi_coef_qp_edit" if use_edit else "psi_coef"
+    det_name  = "psi_det_qp_edit"  if use_edit else "psi_det"
+
+    coef_dims, coef_flat = read_ezfio_array(ezfio_dir, coef_name, dtype=float)
+    det_dims,  det_flat  = read_ezfio_array(ezfio_dir, det_name,  dtype=np.int64)
+
+    # Effective number of determinants actually loaded (10000 in qp_edit mode)
+    n_det = coef_dims[0]
+
+    # EZFIO is Fortran (column-major); reshape to the layout the rest of the
+    # script expects: coef[state, det] and det[det, spin, int].
+    coef = coef_flat.reshape((n_states, n_det))     # dims were [n_det, n_states]
+    det  = det_flat.reshape((n_det, 2, n_int))      # dims were [n_int, 2, n_det]
+
     n_extract = min(args.ndet, n_det)
-    istate    = args.state - 1  # 0-based
 
     print(f"EZFIO    : {args.ezfio}")
-    print(f"N_det    : {n_det}   N_states : {n_states}   N_int : {n_int}")
-    print(f"N_mo     : {n_mo}   N_alpha  : {n_alpha}   N_beta : {n_beta}")
+    src_info = (f"using qp_edit top {n_det}" if use_edit
+                else f"reading FULL array ({n_det} det)")
+    print(f"N_det    : {n_det_full} (full)   |   {src_info}")
+    print(f"N_states : {n_states}   N_int : {n_int}   N_mo : {n_mo}   "
+          f"N_alpha : {n_alpha}   N_beta : {n_beta}")
     mode = "exclusive" if args.exclusive else "top-N"
     print(f"Extracting up to {n_extract} determinants for state {args.state} [{mode}]")
     print()
-
-    # ------------------------------------------------------------------
-    # Read wavefuction arrays
-    # coef shape : (n_states, n_det)   — states vary fastest in memory
-    # det  shape : (n_det, 2, n_int)
-    # ------------------------------------------------------------------
-    coef = np.array(e.get_determinants_psi_coef())  # (n_states, n_det)
-    det  = np.array(e.get_determinants_psi_det())   # (n_det, 2, n_int)
 
     state_coef = coef[istate, :]                    # (n_det,)
 

@@ -15,6 +15,8 @@ Fonctionnalités
   extrapolées par QP) et les graphiques.
 * Énergies extrapolées FCI telles que calculées par QP (dernier bloc « Extrapolated energies »).
 * Graphique de convergence d'un ou plusieurs états en fonction de N_det (--plot).
+* Classification des états par caractère orbital (s/p/d/f/...) déduit de leur
+  dégénérescence (2l+1), utile pour les atomes (--character).
 
 Grandeurs tracées (option --quantity)
 -------------------------------------
@@ -35,6 +37,8 @@ N_det » et « * State k ») ; le script n'en recalcule aucune.
 Exemples
 --------
     python qp_fci_analysis.py Be_fci_20.out --energies
+    python qp_fci_analysis.py Be_fci_20.out --character
+    python qp_fci_analysis.py Be_fci_20.out --character --degeneracy-tol 5e-4
     python qp_fci_analysis.py Be_fci_20.out --table --states 1
     python qp_fci_analysis.py Be_fci_20.out --plot --states 1 2 3
     python qp_fci_analysis.py Be_fci_20.out --plot --states 1-5 --mode relative \
@@ -291,6 +295,56 @@ def last_value(data, state, key):
     return int(xs[-1]), ys[-1]
 
 
+# --------------------------------------------------------------------------- #
+#  Classification par dégénérescence (caractère orbital s/p/d/f/...)
+# --------------------------------------------------------------------------- #
+# Taille du groupe dégénéré (2l+1) -> caractère de moment angulaire orbital.
+L_LABELS = {1: "s", 3: "p", 5: "d", 7: "f", 9: "g", 11: "h"}
+
+
+def classification_energy(data, state, extrap, row):
+    """Énergie de référence d'un état pour la classification par dégénérescence :
+    énergie extrapolée (QP) si disponible, sinon dernière E+PT2, sinon dernière
+    E_var."""
+    r = qp_extrap_value(extrap, state, row)
+    if r and r[1] is not None:
+        return r[1]
+    _, ep = last_value(data, state, "ept2")
+    if ep is not None:
+        return ep
+    _, ev = last_value(data, state, "evar")
+    return ev
+
+
+def group_by_degeneracy(states, data, extrap, row, tol):
+    """Regroupe les états consécutifs dont l'énergie de référence diffère de
+    moins de `tol` (Ha) et étiquette chaque groupe s/p/d/f/... selon sa taille
+    (2l+1)."""
+    ordered = sorted(states)
+    energies = [classification_energy(data, st, extrap, row) for st in ordered]
+    groups, cur = [], [ordered[0]]
+    prev_e = energies[0]
+    for st, e in zip(ordered[1:], energies[1:]):
+        if e is not None and prev_e is not None and abs(e - prev_e) < tol:
+            cur.append(st)
+        else:
+            groups.append(cur)
+            cur = [st]
+        prev_e = e
+    groups.append(cur)
+    return groups
+
+
+def state_to_character(groups):
+    """{état: caractère} à partir des groupes dégénérés."""
+    out = {}
+    for g in groups:
+        label = L_LABELS.get(len(g), f"?({len(g)})")
+        for st in g:
+            out[st] = label
+    return out
+
+
 def parse_states(tokens, available):
     """Interprète '1 2 5', '1-4', 'all'."""
     if not tokens or tokens == ["all"]:
@@ -426,6 +480,40 @@ def print_table(data, states, ndet_min=None, ndet_max=None):
         print("=" * 104)
 
 
+def print_character(groups, data, extrap, row, tol):
+    print()
+    print("Classification par dégénérescence (caractère orbital 2l+1)")
+    print("=" * 56)
+    print(f"  Tolérance de dégénérescence : {tol:g} Ha")
+    print(f"  Énergie de référence : extrapolée (QP, ligne n°{row}) si "
+          f"disponible,\n  sinon E+PT2 convergée, sinon E_var.")
+    print("-" * 56)
+    print(f"{'États':>12} {'E réf. (Ha)':>16} {'Dégén.':>8} {'Caractère':>10}")
+    print("-" * 56)
+    for g in groups:
+        es = [e for st in g if (e := classification_energy(data, st, extrap, row)) is not None]
+        emean = sum(es) / len(es) if es else float("nan")
+        n = len(g)
+        label = L_LABELS.get(n, f"?({n})")
+        st_str = f"{g[0]}" if n == 1 else f"{g[0]}-{g[-1]}"
+        print(f"{st_str:>12} {emean:>16.6f} {n:>8} {label:>10}")
+    print("=" * 56)
+
+
+def write_csv_character(groups, data, extrap, row, path):
+    """CSV de classification : une ligne par état avec son énergie de référence,
+    la taille du groupe dégénéré et le caractère orbital déduit (s/p/d/f/...)."""
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(["State", "E_ref_Ha", "Degeneracy", "Character"])
+        for g in groups:
+            n = len(g)
+            label = L_LABELS.get(n, f"?({n})")
+            for st in g:
+                e = classification_energy(data, st, extrap, row)
+                w.writerow([st, "NaN" if e is None else repr(e), n, label])
+
+
 # --------------------------------------------------------------------------- #
 #  Graphique
 # --------------------------------------------------------------------------- #
@@ -528,6 +616,12 @@ def main():
                    help="affiche le tableau de convergence vs N_det")
     p.add_argument("-p", "--plot", action="store_true",
                    help="trace la convergence en fonction de N_det")
+    p.add_argument("-c", "--character", action="store_true",
+                   help="classe les états par caractère orbital (s/p/d/f/...) "
+                        "déduit de leur dégénérescence (2l+1) ; utile pour les atomes")
+    p.add_argument("--degeneracy-tol", type=float, default=1e-3, metavar="HA",
+                   help="tolérance de dégénérescence en Hartree pour --character "
+                        "(défaut : 1e-3)")
     p.add_argument("-q", "--quantity", nargs="+", default=["evar"],
                    choices=["evar", "ept2", "erpt2"],
                    help="grandeur(s) tracée(s), lues dans la sortie de QP : evar = ligne "
@@ -581,12 +675,12 @@ def main():
           f"{n_states_decl or len(available)} états.")
 
     # Si aucune action n'est demandée : affichage des énergies par défaut.
-    if not (args.energies or args.table or args.plot):
+    if not (args.energies or args.table or args.plot or args.character):
         args.energies = True
 
     states_cli = args.states
     if states_cli is None:  # option non fournie : défaut selon l'action demandée
-        plot_only = args.plot and not (args.energies or args.table)
+        plot_only = args.plot and not (args.energies or args.table or args.character)
         states_cli = ["1"] if plot_only else ["all"]
     states = parse_states(states_cli, available)
     if args.extrap_row < 1:
@@ -609,6 +703,13 @@ def main():
         print_energies(data, states, extrap, args.extrap_row)
     if args.table:
         print_table(data, states, args.ndet_min, args.ndet_max)
+    if args.character:
+        groups = group_by_degeneracy(states, data, extrap, args.extrap_row,
+                                     args.degeneracy_tol)
+        print_character(groups, data, extrap, args.extrap_row, args.degeneracy_tol)
+        csv_char = os.path.join(outdir, f"{stem}_character.csv")
+        write_csv_character(groups, data, extrap, args.extrap_row, csv_char)
+        print(f"Classification enregistrée : {csv_char}")
     if args.plot:
         plot_states = states
         if args.mode == "excitation":
