@@ -47,36 +47,115 @@ HARTREE_TO_EV = 27.211386245988
 # --------------------------------------------------------------------------- #
 # 1. Lecture
 # --------------------------------------------------------------------------- #
+_FLOAT = r"[-+]?\d\.\d+E[-+]\d+"
+
+
+def _read_table(lines, j):
+    """Lit les lignes 'theta Re Im Re Im ...' à partir de j ; renvoie (rows, j_fin).
+
+    Les lignes tronquées (sortie interrompue) sont ignorées : nombre de colonnes
+    impair, différent de la première ligne, ou nombre illisible.
+    """
+    rows = []
+    while j < len(lines):
+        s = lines[j].split()
+        if s and re.fullmatch(_FLOAT, s[0]):
+            try:
+                row = [float(x) for x in s]
+            except ValueError:
+                row = None
+            if row and len(row) % 2 == 1 and (not rows or len(row) == len(rows[0])):
+                rows.append(row)
+        elif rows:           # fin du tableau
+            break
+        j += 1
+    return rows, j
+
+
+def _scan(rows):
+    data = np.array(rows)
+    return dict(theta=data[:, 0], E=data[:, 1::2] + 1j * data[:, 2::2])
+
+
+def _per_theta_from_blocks(lines):
+    """Calcul 'CS-CIPSI per-theta' interrompu : reconstruit le tableau final à partir
+    du dernier tableau 'Energy of the states for theta' de chaque theta convergé."""
+    rows, ndets, last = [], [], None
+    for i, l in enumerate(lines):
+        if "Energy of the states for theta" in l:
+            last = i
+        elif (m := re.match(r"\s*Converged theta\s*=\s*(\S+)\s+N_det\s*=\s*(\d+)", l)) and last is not None:
+            E = []
+            for t in lines[last + 4:]:
+                s = t.split()
+                if not s or not s[0].isdigit():
+                    break
+                E += [float(s[1]), float(s[2])]
+            rows.append([float(m.group(1))] + E)
+            ndets.append(int(m.group(2)))
+            last = None
+    n = min((len(r) for r in rows), default=0)   # même nombre d'états partout
+    return [r[:n] for r in rows], ndets
+
+
 def parse_cs_energies(path):
-    """Retourne une liste d'étapes : dict(theta, E=(nθ, nstates) complexe, ndet)."""
-    with open(path) as f:
+    """Retourne une liste d'étapes : dict(theta, E=(nθ, nstates) complexe, ndet, complete).
+
+    Accepte les sorties non terminées (calcul crashé / interrompu) : on garde les
+    tableaux complets, on ignore la fin tronquée et on met complete=False.
+    """
+    with open(path, errors="replace") as f:
         lines = f.read().splitlines()
+    finished = any(l.startswith("Wall time:") for l in lines[-20:])
 
     scans = []
     i = 0
     while i < len(lines):
-        if "CS energies" in lines[i]:
-            j = i + 1
-            rows = []
-            while j < len(lines):
-                s = lines[j].split()
-                if s and re.fullmatch(r"[-+]?\d\.\d+E[-+]\d+", s[0]):
-                    rows.append([float(x) for x in s])
-                elif rows:           # fin du tableau
-                    break
-                j += 1
-            data = np.array(rows)
-            theta = data[:, 0]
-            E = data[:, 1::2] + 1j * data[:, 2::2]
-            scans.append(dict(theta=theta, E=E))
+        if "CS energies" in lines[i] or "CS per-theta CIPSI energies" in lines[i]:
+            nth = None
+            for l in lines[i + 1:i + 5]:
+                if m := re.match(r"\s*Number of theta values:\s*(\d+)", l):
+                    nth = int(m.group(1))
+            rows, j = _read_table(lines, i + 1)
+            if rows:
+                sc = _scan(rows)
+                sc["complete"] = nth is None or len(rows) == nth
+                scans.append(sc)
             i = j
         i += 1
-    if not scans:
-        raise RuntimeError("Aucun tableau 'CS energies' trouvé dans le fichier.")
+
     ndets = [int(m.group(1)) for l in lines
              if (m := re.match(r"\*\s*Saved determinants\s+(\d+)", l))]
+    # sortie tronquée : un "Saved determinants" précède chaque tableau, on aligne sur le début
+    ok = len(ndets) == len(scans) or (not finished and len(ndets) > len(scans))
     for k, sc in enumerate(scans):
-        sc["ndet"] = ndets[k] if len(ndets) == len(scans) else None
+        sc["ndet"] = ndets[k] if ok else None
+
+    if any("CS-CIPSI per-theta" in l for l in lines):
+        rows, nd = _per_theta_from_blocks(lines)
+        ndet = (nd[0] if len(set(nd)) == 1 else f"{min(nd)}-{max(nd)}") if nd else None
+        if scans:
+            scans[-1]["ndet"] = ndet
+        elif rows:
+            sc = _scan(rows)
+            sc["ndet"] = ndet
+            sc["complete"] = False
+            scans.append(sc)
+            nstep = [int(m.group(1)) for l in lines
+                     if (m := re.search(r"per-theta -- step\s+\d+\s*/\s*(\d+)", l))]
+            tot = f"/{nstep[0]}" if nstep else ""
+            print(f"ATTENTION : calcul per-theta non terminé ; {len(rows)}{tot} valeurs de theta "
+                  f"convergées reconstruites à partir des blocs 'Converged theta'.")
+
+    if not scans:
+        raise RuntimeError("Aucun tableau 'CS energies' (ni theta convergé) trouvé dans le fichier.")
+    if len(scans) > 1 and not scans[-1]["complete"]:
+        print(f"ATTENTION : dernier tableau 'CS energies' tronqué "
+              f"({len(scans[-1]['theta'])} theta) ; étape ignorée.")
+        scans.pop()
+    if not finished:
+        print("ATTENTION : sortie non terminée (pas de 'Wall time' final) : "
+              "seules les étapes complètes disponibles sont analysées.")
     return scans
 
 
