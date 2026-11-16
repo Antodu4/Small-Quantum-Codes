@@ -77,6 +77,20 @@ def _scan(rows):
     return dict(theta=data[:, 0], E=data[:, 1::2] + 1j * data[:, 2::2])
 
 
+def _state_rows(lines, i):
+    """Énergies [Re, Im, Re, Im, ...] du tableau 'Energy of the states for theta' de la ligne i."""
+    E = []
+    for t in lines[i + 4:]:
+        s = t.split()
+        if not s or not s[0].isdigit():
+            break
+        try:
+            E += [float(s[1]), float(s[2])]
+        except (IndexError, ValueError):     # ligne tronquée (sortie en cours d'écriture)
+            break
+    return E
+
+
 def _per_theta_from_blocks(lines):
     """Calcul 'CS-CIPSI per-theta' interrompu : reconstruit le tableau final à partir
     du dernier tableau 'Energy of the states for theta' de chaque theta convergé."""
@@ -85,12 +99,7 @@ def _per_theta_from_blocks(lines):
         if "Energy of the states for theta" in l:
             last = i
         elif (m := re.match(r"\s*Converged theta\s*=\s*(\S+)\s+N_det\s*=\s*(\d+)", l)) and last is not None:
-            E = []
-            for t in lines[last + 4:]:
-                s = t.split()
-                if not s or not s[0].isdigit():
-                    break
-                E += [float(s[1]), float(s[2])]
+            E = _state_rows(lines, last)
             rows.append([float(m.group(1))] + E)
             ndets.append(int(m.group(2)))
             last = None
@@ -98,11 +107,90 @@ def _per_theta_from_blocks(lines):
     return [r[:n] for r in rows], ndets
 
 
-def parse_cs_energies(path):
+_STEP = re.compile(r"per-theta -- step\s+(\d+)\s*/\s*(\d+)\s*-- theta =\s*(\S+)")
+_WALL = re.compile(r"WALL TIME:\s*([\d.]+)\s*s")
+
+
+def per_theta_progress(lines):
+    """Avancement d'un calcul 'CS-CIPSI per-theta' : theta en cours et son état.
+
+    Renvoie None si la sortie n'est pas un calcul per-theta. Sinon un dict :
+    step, nsteps, theta (theta en cours, None si tous terminés), iters (itérations
+    CIPSI terminées pour ce theta), ndet (taille de l'espace courant), E (dernière
+    énergie du Davidson pour ce theta, par état, ou None), E_pt2 et pt2 (dernier
+    E+PT2 et PT2 de ce theta, état 1), t_theta et t_total (secondes).
+    """
+    steps = [(i, m) for i, l in enumerate(lines) if (m := _STEP.search(l))]
+    if not steps:
+        return None
+    i0, m = steps[-1]
+    tail = lines[i0:]
+    p = dict(step=int(m.group(1)), nsteps=int(m.group(2)), theta=float(m.group(3)),
+             iters=0, ndet=None, E=None, E_pt2=None, pt2=None, t_theta=None, t_total=None)
+    if any(re.match(r"\s*Converged theta", l) for l in tail):
+        p["theta"] = None                      # dernier theta terminé (calcul fini ou entre deux theta)
+    pt2re = None
+    for j, l in enumerate(tail):
+        if mm := re.match(r"\*\s*Number of determinants\s+(\d+)", l):
+            p["ndet"] = int(mm.group(1))
+        elif l.startswith("Summary at N_det"):
+            p["iters"] += 1
+        elif "Energy of the states for theta" in l:
+            E = _state_rows(tail, j)
+            if E:
+                p["E"] = np.array(E[0::2]) + 1j * np.array(E[1::2])
+        elif mm := re.match(r"\s*E\+PT2\s*=\s*(\S+)\s+(\S+)", l):
+            try:
+                p["E_pt2"] = complex(float(mm.group(1)), float(mm.group(2)))
+            except ValueError:
+                pass
+        elif mm := re.match(r"\s*PT2 Re\s*=\s*(\S+)", l):
+            pt2re = float(mm.group(1))
+        elif (mm := re.match(r"\s*PT2 Im\s*=\s*(\S+)", l)) and pt2re is not None:
+            p["pt2"] = complex(pt2re, float(mm.group(1)))
+    walls = [(k, float(mm.group(1))) for k, l in enumerate(lines) if (mm := _WALL.search(l))]
+    if walls:
+        p["t_total"] = walls[-1][1]
+        before = [w for k, w in walls if k < i0]
+        p["t_theta"] = walls[-1][1] - (before[-1] if before else 0.0)
+    return p
+
+
+def _fmt_time(t):
+    if t is None:
+        return "?"
+    h = t / 3600
+    return f"{h / 24:.1f} j" if h >= 48 else f"{h:.1f} h"
+
+
+def print_progress(p, finished):
+    """Affiche l'avancement d'un calcul per-theta."""
+    print("\n=== Avancement du calcul per-theta ===")
+    done = p["step"] - (1 if p["theta"] is not None else 0)
+    print(f"  theta terminés : {done} / {p['nsteps']}   (temps écoulé : {_fmt_time(p['t_total'])})")
+    if finished or p["theta"] is None:
+        return
+    print(f"  theta en cours : {p['theta']:.4f} (étape {p['step']}/{p['nsteps']}), "
+          f"depuis {_fmt_time(p['t_theta'])}")
+    print(f"    itérations CIPSI terminées : {p['iters']} ; espace courant : "
+          f"{p['ndet'] if p['ndet'] is not None else '?'} déterminants")
+    if p["E"] is not None:
+        print(f"    dernière énergie du Davidson (état 1) : {p['E'][0].real:.10f} {p['E'][0].imag:+.10f}i Ha")
+    else:
+        print("    pas encore d'énergie convergée pour ce theta (premier Davidson en cours)")
+    if p["E_pt2"] is not None:
+        apt2 = f" ; |PT2| = {abs(p['pt2']):.2e}" if p["pt2"] is not None else ""
+        print(f"    dernier E+PT2 (état 1)                : {p['E_pt2'].real:.10f} {p['E_pt2'].imag:+.10f}i Ha{apt2}")
+
+
+def parse_cs_energies(path, include_current=False):
     """Retourne une liste d'étapes : dict(theta, E=(nθ, nstates) complexe, ndet, complete).
 
-    Accepte les sorties non terminées (calcul crashé / interrompu) : on garde les
-    tableaux complets, on ignore la fin tronquée et on met complete=False.
+    Accepte les sorties non terminées (calcul en cours, crashé ou interrompu) : on
+    garde les tableaux complets, on ignore la fin tronquée et on met complete=False.
+    Pour un calcul per-theta en cours, l'avancement est rangé dans scans[-1]["progress"] ;
+    avec include_current=True, la dernière énergie du Davidson du theta en cours est
+    ajoutée comme point provisoire (scans[-1]["provisional"] = ce theta).
     """
     with open(path, errors="replace") as f:
         lines = f.read().splitlines()
@@ -146,8 +234,28 @@ def parse_cs_energies(path):
             tot = f"/{nstep[0]}" if nstep else ""
             print(f"ATTENTION : calcul per-theta non terminé ; {len(rows)}{tot} valeurs de theta "
                   f"convergées reconstruites à partir des blocs 'Converged theta'.")
+        prog = per_theta_progress(lines)
+        if scans:
+            scans[-1]["progress"] = prog
+            if include_current and not finished and prog and prog["theta"] is not None:
+                sc = scans[-1]
+                if prog["E"] is None or len(prog["E"]) < sc["E"].shape[1]:
+                    print("ATTENTION : --include-current : pas encore d'énergie pour le theta en cours ; ignoré.")
+                elif prog["theta"] > sc["theta"][-1]:
+                    sc["theta"] = np.append(sc["theta"], prog["theta"])
+                    sc["E"] = np.vstack([sc["E"], prog["E"][:sc["E"].shape[1]]])
+                    sc["provisional"] = prog["theta"]
+                    print(f"ATTENTION : theta = {prog['theta']:.4f} ajouté comme point PROVISOIRE "
+                          f"(itération {prog['iters'] + 1} du CIPSI, {prog['ndet']} déterminants, non convergé).")
+    elif not finished and scans:
+        nd = [int(m.group(1)) for l in lines if (m := re.match(r"\*\s*Number of determinants\s+(\d+)", l))]
+        print(f"Calcul en cours : étape {len(scans) + 1} en cours"
+              + (f" ({nd[-1]} déterminants)" if nd else "") + ".")
 
     if not scans:
+        prog = per_theta_progress(lines)
+        if prog is not None:
+            print_progress(prog, finished)
         raise RuntimeError("Aucun tableau 'CS energies' (ni theta convergé) trouvé dans le fichier.")
     if len(scans) > 1 and not scans[-1]["complete"]:
         print(f"ATTENTION : dernier tableau 'CS energies' tronqué "
@@ -246,6 +354,22 @@ def find_resonances(theta, T, threshold=None, logderiv=False, theta_min=0.0,
     return merged
 
 
+def edge_trend(theta, T, res, logderiv=False, states=None):
+    """Trajectoires dont la vitesse décroît encore au dernier theta calculé (aucun minimum
+    au-delà de l'avant-dernier point) : leur point stationnaire, s'il existe, est au-delà
+    de la grille, ce qui arrive typiquement pour un scan en cours."""
+    if len(theta) < 3:
+        return []
+    out = []
+    for n in (states if states is not None else range(T.shape[1])):
+        tf, v, _ = velocity(theta, T[:, n], logderiv)
+        k = np.searchsorted(tf, theta[-2])
+        if v[-1] < v[k] and not any(str(n + 1) in str(r["traj"]).split(",") and r["theta"] >= theta[-2]
+                                    for r in res):
+            out.append((n + 1, v[k], v[-1]))
+    return out
+
+
 def diagnostics(theta, T, logderiv, theta_min=0.0):
     """Vitesse minimale de chaque trajectoire (sans filtre) pour inspection."""
     rows = []
@@ -270,7 +394,27 @@ def save_csv(outdir, s, theta, T, V):
     return path
 
 
-def make_plots(outdir, s, theta, T, V, res, threshold, logderiv, show_resonances=True, show_legend=True):
+def _draw_points(ax, x, y, c, theta=None, provisional=None, labels=False):
+    """Points calculés : disques pleins à liseré blanc ; point provisoire (theta en
+    cours, --include-current) en disque creux ; étiquettes theta en option."""
+    x, y = np.asarray(x), np.asarray(y)
+    prov = np.zeros(len(x), bool)
+    if provisional is not None and theta is not None:
+        prov = np.isclose(np.asarray(theta), provisional)
+    ax.plot(x[~prov], y[~prov], "o", color=c, ms=8, mec="white", mew=2, zorder=4)
+    if prov.any():
+        ax.plot(x[prov], y[prov], "o", color=c, ms=8, mfc="white", mec=c, mew=2, zorder=4,
+                label="provisoire (θ en cours)")
+    ax.ticklabel_format(useOffset=False, style="plain")       # énergies lisibles en clair
+    if labels and theta is not None:
+        ax.margins(x=0.10)                                     # place pour les étiquettes du bord
+        for xi, yi, th, p in zip(x, y, theta, prov):
+            ax.annotate(rf"$\theta={th:.3f}$" + (" (prov.)" if p else ""), (xi, yi), xytext=(8, 2),
+                        textcoords="offset points", fontsize=8, color="0.3")
+
+
+def make_plots(outdir, s, theta, T, V, res, threshold, logderiv, show_resonances=True, show_legend=True,
+               points=False, theta_labels=False, provisional=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -280,7 +424,9 @@ def make_plots(outdir, s, theta, T, V, res, threshold, logderiv, show_resonances
     # (a) plan complexe
     fig, ax = plt.subplots(figsize=(8, 6))
     for n in range(T.shape[1]):
-        ax.plot(T[:, n].real, T[:, n].imag, "-", lw=1, alpha=.7)
+        ln, = ax.plot(T[:, n].real, T[:, n].imag, "-", lw=2 if points else 1, alpha=1 if points else .7)
+        if points:
+            _draw_points(ax, T[:, n].real, T[:, n].imag, ln.get_color(), theta, provisional, theta_labels)
     if show_resonances:
         for r in res:
             ax.plot(r["E"].real, r["E"].imag, "ro", ms=7)
@@ -302,7 +448,9 @@ def make_plots(outdir, s, theta, T, V, res, threshold, logderiv, show_resonances
         tf, v, Ef = velocity(theta, T[:, n], logderiv)
         if threshold is not None and Ef.real.max() <= threshold:
             continue
-        ax.semilogy(tf, v, lw=1, label=f"traj {n+1}")
+        ln, = ax.semilogy(tf, v, lw=2 if points else 1, label=f"traj {n+1}")
+        if points:
+            _draw_points(ax, theta, np.interp(theta, tf, v), ln.get_color(), theta, provisional)
     if show_resonances:
         for r in res:
             ax.plot(r["theta"], r["v"], "ro", ms=6)
@@ -582,7 +730,8 @@ def add_zoom_inset(ax, curves, box, zoom, res_pts=(), threshold=None, title=None
 def make_side_by_side(outdir, s, theta, T, res, threshold, logderiv, states,
                       show=False, ylog=True, xlim=None, ylim=None,
                       theta_range=None, show_resonances=True, show_legend=True,
-                      zoom=None, label_resonances=False):
+                      zoom=None, label_resonances=False, points=False, theta_labels=False,
+                      provisional=None):
     """Figure à 2 panneaux : trajectoires dans le plan complexe | vélocité vs theta."""
     import matplotlib
     if not show:
@@ -635,12 +784,16 @@ def make_side_by_side(outdir, s, theta, T, res, threshold, logderiv, states,
             v_pt = np.interp(theta_sub[0], tf, v)
             ax2.plot(theta_sub[0], v_pt, "o", color=c, ms=6, label=lab)
         else:
-            ax1.plot(E.real, E.imag, "-", color=c, lw=1.4, label=lab)
+            ax1.plot(E.real, E.imag, "-", color=c, lw=2 if points else 1.4, label=lab)
             drawn.append((E, c, "-", g))
-            ax1.plot(E.real[0], E.imag[0], "o", color=c, ms=4)            # début de l'intervalle
-            ax1.plot(E.real[-1], E.imag[-1], ">", color=c, ms=6)          # fin de l'intervalle
             tf, v, _ = velocity(theta_sub, E, logderiv)
-            ax2.plot(tf, v, "-", color=c, lw=1.4, label=lab)
+            ax2.plot(tf, v, "-", color=c, lw=2 if points else 1.4, label=lab)
+            if points:
+                _draw_points(ax1, E.real, E.imag, c, theta_sub, provisional, theta_labels)
+                _draw_points(ax2, theta_sub, np.interp(theta_sub, tf, v), c, theta_sub, provisional)
+            else:
+                ax1.plot(E.real[0], E.imag[0], "o", color=c, ms=4)            # début de l'intervalle
+                ax1.plot(E.real[-1], E.imag[-1], ">", color=c, ms=6)          # fin de l'intervalle
 
     # résonances visibles dans la fenêtre / les états choisis
     sel = set(states)
@@ -673,7 +826,7 @@ def make_side_by_side(outdir, s, theta, T, res, threshold, logderiv, states,
     if single_point:
         ax1.set_title(f"Étape {s} : états à θ = {theta_sub[0]:.4f} rad")
     else:
-        ax1.set_title(f"Étape {s} : trajectoires E(θ)   (● θ min, ▶ θ max)")
+        ax1.set_title(f"Étape {s} : trajectoires E(θ)" + ("" if points else "   (● θ min, ▶ θ max)"))
     if label_resonances and res_vis:
         label_text = "\n".join(
             f"$E_R$ = ({r['E'].real:.5f}{r['E'].imag:+.5f}i) Ha\n"
@@ -768,7 +921,8 @@ def export_energies(outdir, s, ndet, theta, T, E_sorted, states, order):
 
 def make_rotation_plot(outdir, tag, runs, threshold, states, show=False,
                        theta_marks=0.1, xlim=None, ylim=None, labels=True, show_legend=True,
-                       zoom=None, res=None, label_resonances=False):
+                       zoom=None, res=None, label_resonances=False, points=False,
+                       theta_labels=False, provisional=None):
     """Rotation des états dans le plan complexe."""
     import matplotlib
     if not show:
@@ -792,7 +946,12 @@ def make_rotation_plot(outdir, tag, runs, threshold, states, show=False,
             lab = (",".join(map(str, g)) if len(g) <= 3 else f"{g[0]}-{g[-1]}")
             ax.plot(E.real, E.imag, ls, color=c, lw=1.4,
                     label=lab if r == len(runs) - 1 else None)
-            if r == len(runs) - 1:
+            if r == len(runs) - 1 and points:
+                _draw_points(ax, E.real, E.imag, c, theta, provisional, theta_labels)
+                if labels:
+                    ax.annotate(lab, (E.real[-1], E.imag[-1]), fontsize=7,
+                                xytext=(5, -12), textcoords="offset points", color=c)
+            elif r == len(runs) - 1:
                 idx = [i for i, th in enumerate(theta)
                        if abs(th / theta_marks - round(th / theta_marks)) < 1e-6]
                 ax.plot(E.real[idx], E.imag[idx], "o", color=c, ms=3.5)
@@ -831,7 +990,7 @@ def make_rotation_plot(outdir, tag, runs, threshold, states, show=False,
     ax.set_ylabel("$Im[E]$ (Ha)")
     names = ", ".join(r[0] for r in runs)
     ax.set_title(f"Rotation des états dans le plan complexe ({names})\n"
-                 f"■ θ=0   ● tous les {theta_marks} rad   ▶ θ max")
+                 + ("● chaque θ calculé" if points else f"■ θ=0   ● tous les {theta_marks} rad   ▶ θ max"))
     ax.grid(alpha=.3)
 
     if zoom is not None and drawn:
@@ -892,6 +1051,12 @@ def main():
 
   # Masquer les points rouges des résonances et désactiver la légende
   python cs_resonance.py He_cs.out --step last --plot --states 7-20 --no-resonances --no-legend
+
+  # Calcul per-theta EN COURS : avancement + theta convergés, et theta en cours en point provisoire
+  python cs_resonance.py Be_cs_ws_scan.cs.out --plot --include-current
+
+  # Afficher chaque theta calculé (points) et leurs valeurs
+  python cs_resonance.py Be_cs_ws_scan.cs.out --plot --points --theta-labels
 """
     p = argparse.ArgumentParser(prog="cs_resonance.py", description=__doc__,
                                 epilog=epilog, formatter_class=Fmt)
@@ -919,6 +1084,9 @@ def main():
                    help="profondeur minimale d'un minimum de vitesse")
     g.add_argument("--imag-tol", type=float, default=None, metavar="G",
                    help="ne garde que les minima avec Im[E] < -G")
+    g.add_argument("--include-current", action="store_true",
+                   help="calcul per-theta en cours : ajoute le theta en cours comme point "
+                        "PROVISOIRE (dernière énergie du Davidson, non convergée)")
     g.add_argument("--diag", action="store_true",
                    help="affiche la vitesse minimale de chaque trajectoire")
     g.add_argument("--scan-analysis", action="store_true",
@@ -937,6 +1105,11 @@ def main():
                    help="superpose les étapes choisies sur un seul graphique")
     g.add_argument("--plot", action="store_true",
                    help="figure à 2 panneaux : plan complexe | vélocité(theta)")
+    g.add_argument("--points", action="store_true",
+                   help="affiche chaque theta calculé (disque à liseré blanc) en plus de la courbe ; "
+                        "le point provisoire de --include-current est un disque creux")
+    g.add_argument("--theta-labels", action="store_true",
+                   help="avec --points : étiquette chaque point par sa valeur de theta")
     g.add_argument("--theta-marks", type=float, default=0.1, metavar="PAS",
                    help="pas (rad) des repères en theta sur la rotation")
     g.add_argument("--theta-range", type=float, nargs="+", metavar="THETA",
@@ -1001,9 +1174,12 @@ def main():
                     xlim=a.zoom_xlim, ylim=a.zoom_ylim)
 
     os.makedirs(a.outdir, exist_ok=True)
-    scans = parse_cs_energies(a.file)
+    scans = parse_cs_energies(a.file, include_current=a.include_current)
     print(f"{len(scans)} étape(s) de convergence trouvée(s) ; "
           f"{len(scans[0]['theta'])} valeurs de theta, {scans[0]['E'].shape[1]} états")
+    if scans[-1].get("progress"):
+        print_progress(scans[-1]["progress"], all(sc["complete"] for sc in scans)
+                       and scans[-1]["progress"]["theta"] is None)
 
     allT = [track_trajectories(sc["theta"], sc["E"]) for sc in scans]
     if len(scans) > 1:
@@ -1039,6 +1215,8 @@ def main():
 
         csv = save_csv(a.outdir, s, theta, T, V)
         print(f"\n=== Étape {s} ({sc['ndet']} déterminants) ===  (CSV : {csv})")
+        if sc.get("provisional") is not None:
+            print(f"  NB : le dernier point (theta = {sc['provisional']:.4f}) est provisoire (theta en cours).")
         if not a.scan_analysis:
             if not res:
                 print("  aucun minimum de vitesse trouvé (avec les filtres actifs)")
@@ -1076,6 +1254,14 @@ def main():
                 print("    résonance de référence : "
                       f"theta={best['theta']:.5f} rad, E=({best['E'].real:.7f}{best['E'].imag:+.7f}i) Ha, "
                       f"prominence_norm={best['depth']:.4g}")
+        if not sc["complete"] or sc.get("progress"):
+            trend = edge_trend(theta, T, res, a.logderiv,
+                               states=None if T.shape[1] <= 10 else
+                               sorted({int(str(r["traj"]).split(",")[0]) - 1 for r in res}))
+            for n, v0, v1 in trend:
+                print(f"  trajectoire {n} : vitesse encore décroissante au dernier theta "
+                      f"({v0:.3e} -> {v1:.3e} entre {theta[-2]:.4f} et {theta[-1]:.4f}) : "
+                      f"point stationnaire non encore atteint, au-delà de theta = {theta[-1]:.4f}")
         if a.diag:
             print("  -- diagnostic : vitesse minimale par trajectoire (theta >= theta-min) --")
             print("  traj  E(th=0)    v_min      theta   Re[E]       Im[E]      v_median")
@@ -1091,7 +1277,9 @@ def main():
                                      theta_marks=a.theta_marks, xlim=a.xlim,
                                      ylim=a.ylim, labels=not a.no_labels,
                                      show_legend=not a.no_legend, zoom=zoom, res=res,
-                                     label_resonances=a.label_resonances)
+                                     label_resonances=a.label_resonances, points=a.points,
+                                     theta_labels=a.theta_labels,
+                                     provisional=sc.get("provisional"))
             print(f"  figure rotation : {png}")
         if a.plot:
             png = make_side_by_side(a.outdir, s, theta, T, res, a.threshold,
@@ -1100,12 +1288,15 @@ def main():
                                     theta_range=a.theta_range,
                                     show_resonances=not a.no_resonances,
                                     show_legend=not a.no_legend, zoom=zoom,
-                                    label_resonances=a.label_resonances)
+                                    label_resonances=a.label_resonances, points=a.points,
+                                    theta_labels=a.theta_labels,
+                                    provisional=sc.get("provisional"))
             print(f"  figure : {png}")
         if not a.no_plot and not a.plot and not a.rotation:
             make_plots(a.outdir, s, theta, T, V, res, a.threshold, a.logderiv,
                        show_resonances=not a.no_resonances,
-                       show_legend=not a.no_legend)
+                       show_legend=not a.no_legend, points=a.points,
+                       theta_labels=a.theta_labels, provisional=sc.get("provisional"))
 
     if a.rotation and a.compare:
         runs = [(f"étape {k}", scans[k - 1]["theta"], allT[k - 1]) for k in todo]
@@ -1117,7 +1308,8 @@ def main():
                                  show_legend=not a.no_legend, zoom=zoom,
                                  res=find_resonances(runs[-1][1], runs[-1][2], a.threshold, a.logderiv, a.theta_min,
                                                      imag_tol=a.imag_tol, prominence=a.prominence),
-                                 label_resonances=a.label_resonances)
+                                 label_resonances=a.label_resonances, points=a.points,
+                                 theta_labels=a.theta_labels)
         print(f"\nfigure comparaison des étapes : {png}")
 
 
